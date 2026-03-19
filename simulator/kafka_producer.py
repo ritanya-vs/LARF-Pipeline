@@ -8,24 +8,25 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from confluent_kafka import Producer
 from patient_generator import generate_patient_event
+from database import insert_ehr_event, insert_iot_event
 
-TOPICS = ["ehr-stream", "iot-vitals", "genomic-data"]
+KAFKA_BOOTSTRAP = "localhost:9092"
 
 def delivery_report(err, msg):
     if err:
-        print(f"[ERROR] Delivery failed: {err}")
+        print(f"[ERROR] Kafka delivery failed: {err}")
 
 def stream_events(duration_seconds=60, interval=1.0):
-    producer = Producer({"bootstrap.servers": "localhost:9092"})
+    producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
 
-    print(f"[INFO] Streaming to Kafka for {duration_seconds}s (interval={interval}s)...")
+    print(f"[INFO] Streaming for {duration_seconds}s (interval={interval}s)...")
     start = time.time()
     count = 0
 
     while time.time() - start < duration_seconds:
         event = generate_patient_event()
 
-        # Primary topic gets all events
+        # 1. Push full event to Kafka ehr-stream topic
         producer.produce(
             "ehr-stream",
             key=event["patient_id"],
@@ -33,12 +34,12 @@ def stream_events(duration_seconds=60, interval=1.0):
             callback=delivery_report
         )
 
-        # iot-vitals gets just the sensor readings
+        # 2. Push sensor-only payload to Kafka iot-vitals topic
         iot_payload = {
-            "patient_id":    event["patient_id"],
-            "heart_rate":    event["heart_rate"],
-            "spo2":          event["spo2"],
-            "timestamp":     event["timestamp"],
+            "patient_id": event["patient_id"],
+            "heart_rate": event["heart_rate"],
+            "spo2":       event["spo2"],
+            "timestamp":  event["timestamp"],
         }
         producer.produce(
             "iot-vitals",
@@ -48,16 +49,21 @@ def stream_events(duration_seconds=60, interval=1.0):
         )
 
         producer.poll(0)
+
+        # 3. Write to Databricks Delta tables
+        insert_ehr_event(event)
+        insert_iot_event(iot_payload)
+
         count += 1
 
-        if count % 10 == 0:
+        if count % 5 == 0:
             elapsed = round(time.time() - start, 1)
-            print(f"[INFO] {count} events sent ({elapsed}s elapsed)...")
+            print(f"[INFO] {count} events → Kafka + Databricks ({elapsed}s elapsed)...")
 
         time.sleep(interval)
 
     producer.flush()
-    print(f"[DONE] Streamed {count} events.")
+    print(f"[DONE] Streamed {count} events to Kafka and Databricks.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
