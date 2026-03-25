@@ -12,6 +12,7 @@ NORMAL_RANGES = {
     "bp_diastolic":  (60, 90),
     "spo2":          (95, 100),
     "temperature_c": (36.1, 37.8),
+    "respiratory_rate": (12, 20),
 }
 
 def generate_patient_event(anomalous=False):
@@ -34,6 +35,7 @@ def generate_patient_event(anomalous=False):
         "bp_diastolic":  val("bp_diastolic"),
         "spo2":          val("spo2"),
         "temperature_c": val("temperature_c"),
+        "respiratory_rate": val("respiratory_rate"),
         "timestamp":     datetime.utcnow().isoformat(),
     }
 
