@@ -5,6 +5,9 @@ import argparse
 from datetime import datetime
 from confluent_kafka import Producer
 from patient_generator import generate_patient_event
+import requests
+import threading
+from database import get_connection
 
 KAFKA_BOOTSTRAP = "localhost:9092"
 
@@ -48,17 +51,41 @@ def inject_data_quality_fault(n_events=30):
     producer.flush()
     print("[FAULT] Data quality fault done.")
 
-# ── Fault 3 ───────────────────────────────────────────────────────
+
+# ── Fault 3 (UPDATED) ──────────────────────────────────────────────
 def inject_performance_fault(duration_seconds=30):
-    print(f"[FAULT] PERFORMANCE — flooding Kafka for {duration_seconds}s (no sleep)...")
+    print(f"[FAULT] PERFORMANCE — Executing heavy Cartesian join to choke Databricks...")
+    
+    def heavy_query():
+        try:
+            con = get_connection()
+            cursor = con.cursor()
+            # A massive cross join to max out warehouse compute
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM healthcare_db.ehr_stream a
+                CROSS JOIN healthcare_db.ehr_stream b
+                LIMIT 50000000
+            """)
+            cursor.close()
+            con.close()
+        except Exception as e:
+            print(f"[DB ERROR] {e}")
+
+    # 1. Fire off the heavy query in the background so it doesn't block the stream
+    t = threading.Thread(target=heavy_query)
+    t.start()
+
+    # 2. Continue normal event streaming
+    print(f"[FAULT] Heavy query running. Continuing normal stream for {duration_seconds}s...")
     start = time.time()
     count = 0
     while time.time() - start < duration_seconds:
-        event = generate_patient_event()
-        _send("ehr-stream", event)
+        _send("ehr-stream", generate_patient_event())
+        time.sleep(1)
         count += 1
-    producer.flush()
-    print(f"[FAULT] Performance fault done. Sent {count} events in {duration_seconds}s.")
+        
+    print(f"[FAULT] Performance fault stream done.")
 
 # ── Fault 4 ───────────────────────────────────────────────────────
 def inject_security_fault(n_events=50):
@@ -72,16 +99,35 @@ def inject_security_fault(n_events=50):
     producer.flush()
     print("[FAULT] Security fault done.")
 
-# ── Fault 5 ───────────────────────────────────────────────────────
+
+# ── Fault 5 (UPDATED) ──────────────────────────────────────────────
 def inject_stall_fault(pause_seconds=45):
-    print(f"[FAULT] STALL — stopping all events for {pause_seconds}s...")
-    print(f"[FAULT] Watch consumer lag rise in Kafka UI at http://localhost:8080")
-    time.sleep(pause_seconds)
-    print("[FAULT] Stall over — sending 5 recovery events...")
-    for _ in range(5):
+    print(f"[FAULT] STALL — Pausing Databricks Sink Connector for {pause_seconds}s...")
+    
+    # 1. Pause the connector via Kafka Connect REST API
+    try:
+        requests.put("http://localhost:8083/connectors/databricks-sink/pause")
+        print("[FAULT] Connector paused! Building up consumer lag...")
+    except Exception as e:
+        print(f"[WARNING] Could not reach Kafka Connect REST API: {e}")
+        print("[WARNING] Make sure your Databricks Sink connector is named 'databricks-sink' and running on port 8083.")
+
+    # 2. Continue producing events at a normal rate to build lag
+    start = time.time()
+    count = 0
+    while time.time() - start < pause_seconds:
         _send("ehr-stream", generate_patient_event())
-    producer.flush()
-    print("[FAULT] Stall fault done.")
+        count += 1
+        time.sleep(1) 
+
+    print(f"[FAULT] Sent {count} events while stalled. Resuming connector...")
+    
+    # 3. Resume the connector
+    try:
+        requests.put("http://localhost:8083/connectors/databricks-sink/resume")
+        print("[FAULT] Connector resumed. Watch lag decrease in Kafka UI.")
+    except Exception as e:
+        print(f"[WARNING] Could not reach Kafka Connect REST API to resume: {e}")
 
 # ── CLI ────────────────────────────────────────────────────────────
 FAULTS = {
