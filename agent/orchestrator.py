@@ -16,31 +16,52 @@ from detectors.schema_entropy  import check_batch as schema_batch
 
 KAFKA_BOOTSTRAP = "localhost:9092"
 WINDOW_SIZE     = 50   # how many events to read before running detectors
-
 def consume_events(topic="ehr-stream", n=50, timeout_seconds=30) -> list:
     """
-    Reads the last N events from Kafka.
-    Returns them as a list of dicts.
+    Reads the LAST N events from Kafka by seeking to end-offset minus n.
+    This guarantees we always see the most recent events.
     """
-    consumer = Consumer({
-        "bootstrap.servers": KAFKA_BOOTSTRAP,
-        "group.id":          f"larf-orchestrator-{int(time.time())}",
-        "auto.offset.reset": "earliest",
-    })
-    consumer.subscribe([topic])
+    from confluent_kafka import TopicPartition
 
-    print(f"[ORCHESTRATOR] Reading {n} events from '{topic}'...")
-    events  = []
-    start   = time.time()
+    # Step 1 — find current end offset
+    probe = Consumer({
+        "bootstrap.servers": KAFKA_BOOTSTRAP,
+        "group.id":          f"larf-probe-{int(time.time())}",
+    })
+    probe.assign([TopicPartition(topic, 0)])
+    low, high = probe.get_watermark_offsets(
+        TopicPartition(topic, 0), timeout=5
+    )
+    probe.close()
+
+    # Step 2 — seek to (end - n)
+    start_offset = max(low, high - n)
+    print(f"[ORCHESTRATOR] Topic has {high} total events. "
+          f"Reading last {n} from offset {start_offset}...")
+
+    # Step 3 — consume from that offset
+    consumer = Consumer({
+        "bootstrap.servers":  KAFKA_BOOTSTRAP,
+        "group.id":           f"larf-orchestrator-{int(time.time())}",
+        "auto.offset.reset":  "earliest",
+        "enable.auto.commit": "false",
+    })
+    tp = TopicPartition(topic, 0, start_offset)
+    consumer.assign([tp])
+
+    events = []
+    start  = time.time()
 
     while len(events) < n and (time.time() - start) < timeout_seconds:
         msg = consumer.poll(timeout=1.0)
         if msg is None:
+            if events:
+                break
             continue
         if msg.error():
             if msg.error().code() != KafkaError._PARTITION_EOF:
                 print(f"[ERROR] {msg.error()}")
-            continue
+            break
         try:
             event = json.loads(msg.value().decode("utf-8"))
             events.append(event)
@@ -50,6 +71,13 @@ def consume_events(topic="ehr-stream", n=50, timeout_seconds=30) -> list:
     consumer.close()
     print(f"[ORCHESTRATOR] Collected {len(events)} events in "
           f"{round(time.time()-start, 1)}s")
+
+    # Debug — show how many look like fault events
+    fault_count = sum(1 for e in events if "spo2" not in e
+                      or "diagnosis_code" in e
+                      or float(e.get("heart_rate", 80)) > 200)
+    print(f"[ORCHESTRATOR] ~{fault_count} events look anomalous")
+
     return events
 
 def run_detectors(events: list) -> list:
@@ -71,7 +99,7 @@ def run_detectors(events: list) -> list:
     # 1. Z-Score detector
     zscore_result = zscore_batch(events)
     if zscore_result["fault_detected"]:
-        print(f"[DETECT] ⚠️  Z-Score anomaly — "
+        print(f"[DETECT]  Z-Score anomaly — "
               f"{zscore_result['flagged_events']}/{zscore_result['total_events']} events flagged")
         alerts.append({
             "detector":       "zscore",
@@ -84,7 +112,7 @@ def run_detectors(events: list) -> list:
     ks_result = run_ks_test(events)
     if ks_result["drift_detected"]:
         drifted = [f for f, r in ks_result["fields"].items() if r["drifted"]]
-        print(f"[DETECT] ⚠️  KS-Test drift detected in fields: {drifted}")
+        print(f"[DETECT]  KS-Test drift detected in fields: {drifted}")
         alerts.append({
             "detector":      "ks_test",
             "timestamp":     datetime.now(timezone.utc).isoformat(),
@@ -95,7 +123,7 @@ def run_detectors(events: list) -> list:
     # 3. Schema entropy detector
     schema_result = schema_batch(events)
     if schema_result["fault_detected"]:
-        print(f"[DETECT] ⚠️  Schema anomaly — "
+        print(f"[DETECT]  Schema anomaly — "
               f"{schema_result['flagged_events']} malformed events | "
               f"missing={schema_result['missing_fields']} | "
               f"extra={schema_result['extra_fields']}")
@@ -108,7 +136,7 @@ def run_detectors(events: list) -> list:
         })
 
     if not alerts:
-        print("[DETECT] ✅ All detectors clear — pipeline is healthy")
+        print("[DETECT] All detectors clear — pipeline is healthy")
 
     return alerts
 
@@ -117,7 +145,7 @@ def run_ooda_cycle():
     One full Observe → Orient → Decide → Act cycle.
     """
     print("\n" + "="*55)
-    print("🌟 LARF OODA CYCLE STARTED")
+    print(" LARF OODA CYCLE STARTED")
     print("="*55 + "\n")
 
     # ── OBSERVE ──────────────────────────────────────────
@@ -129,7 +157,7 @@ def run_ooda_cycle():
     alerts = run_detectors(events)
 
     if not alerts:
-        print("\n✅ No faults detected. Pipeline is healthy. Exiting.")
+        print("\n No faults detected. Pipeline is healthy. Exiting.")
         return
 
     # ── DECIDE ───────────────────────────────────────────
@@ -151,7 +179,7 @@ def run_ooda_cycle():
     result = agent.resolve_crisis(crisis_packet)
 
     print("\n" + "="*55)
-    print("✅ OODA CYCLE COMPLETE")
+    print(" OODA CYCLE COMPLETE")
     print("="*55)
 
     if result:

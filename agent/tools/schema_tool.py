@@ -22,7 +22,7 @@ def execute_sql_ddl(command: str) -> str:
     Example: ALTER TABLE healthcare_db.ehr_stream ADD COLUMN spo2 DOUBLE
     """
     command = _clean_sql(command)
-    print(f"\n[🔧 SCHEMA TOOL] Executing SQL...")
+    print(f"\n[SCHEMA TOOL] Executing SQL...")
     print(f"> {command}")
 
     try:
@@ -35,5 +35,5 @@ def execute_sql_ddl(command: str) -> str:
         return "SUCCESS: SQL command executed successfully. The schema has been updated."
     except Exception as e:
         error_msg = f"FAILED: Database error occurred - {str(e)}"
-        print(f"[❌ ERROR] {error_msg}")
+        print(f"[ERROR] {error_msg}")
         return error_msg

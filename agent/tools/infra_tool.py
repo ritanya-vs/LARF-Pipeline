@@ -18,7 +18,7 @@ def execute_bash_command(command: str) -> str:
     Example: curl -X POST http://localhost:8083/connectors/ehr-sink/tasks/0/restart
     """
     command = _clean_cmd(command)
-    print(f"\n[⚙️ INFRA TOOL] Executing Bash Command...")
+    print(f"\n[INFRA TOOL] Executing Bash Command...")
     print(f"> {command}")
 
     try:
@@ -31,9 +31,9 @@ def execute_bash_command(command: str) -> str:
         else:
             error_msg = (f"FAILED: Exit code {result.returncode}. "
                         f"Error: {result.stderr.strip()}")
-            print(f"[❌ ERROR] {error_msg}")
+            print(f"[ERROR] {error_msg}")
             return error_msg
     except Exception as e:
         error_msg = f"FAILED: System execution error - {str(e)}"
-        print(f"[❌ ERROR] {error_msg}")
+        print(f"[ERROR] {error_msg}")
         return error_msg

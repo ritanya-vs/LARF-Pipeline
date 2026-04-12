@@ -18,7 +18,7 @@ def quarantine_patient(patient_id: str) -> str:
     Input must be just the patient_id string. Example: PT-ATTACKER-0000
     """
     patient_id = _clean_id(patient_id)
-    print(f"\n[🛡️ SECURITY TOOL] Quarantining Patient: {patient_id}...")
+    print(f"\n[SECURITY TOOL] Quarantining Patient: {patient_id}...")
 
     try:
         conn   = get_connection()
@@ -32,5 +32,5 @@ def quarantine_patient(patient_id: str) -> str:
         return f"SUCCESS: Patient {patient_id} quarantined. {rows} spam records purged."
     except Exception as e:
         error_msg = f"FAILED: Security quarantine error - {str(e)}"
-        print(f"[❌ ERROR] {error_msg}")
+        print(f"[ERROR] {error_msg}")
         return error_msg

@@ -1,13 +1,17 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(__file__))
+from patient_generator import generate_patient_event
+from database import get_connection
+
 import json
 import time
 import random
 import argparse
 from datetime import datetime
 from confluent_kafka import Producer
-from patient_generator import generate_patient_event
 import requests
 import threading
-from database import get_connection
 
 KAFKA_BOOTSTRAP = "localhost:9092"
 
@@ -28,15 +32,41 @@ def _send(topic, event):
 
 # ── Fault 1 ───────────────────────────────────────────────────────
 def inject_schema_fault(n_events=20):
-    print(f"[FAULT] SCHEMA — sending {n_events} events missing 'spo2' + extra unknown field...")
+    print(f"[FAULT] SCHEMA — sending {n_events} fault events...")
     for _ in range(n_events):
         event = generate_patient_event()
-        event.pop("spo2")                                        # remove required field
-        event["diagnosis_code"] = "ICD-" + str(random.randint(1000, 9999))  # add unknown field
+        event.pop("spo2")
+        event["diagnosis_code"] = "ICD-" + str(random.randint(1000, 9999))
+
+        # Write to Kafka as before
         _send("ehr-stream", event)
+
+        # Also write directly to Databricks so the fault is real
+        try:
+            con    = get_connection()
+            cursor = con.cursor()
+            cursor.execute("""
+                INSERT INTO healthcare_db.ehr_stream
+                (event_id, patient_id, ward, heart_rate, bp_systolic,
+                 bp_diastolic, temperature_c, respiratory_rate,
+                 timestamp, inserted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                event["event_id"], event["patient_id"], event["ward"],
+                event["heart_rate"], event["bp_systolic"],
+                event["bp_diastolic"], event["temperature_c"],
+                event.get("respiratory_rate", 15.0),
+                event["timestamp"], datetime.utcnow().isoformat()
+            ])
+            con.commit()
+            cursor.close()
+            con.close()
+        except Exception as e:
+            print(f"[DB] {e}")
+
         time.sleep(0.3)
     producer.flush()
-    print("[FAULT] Schema fault done.")
+    print("[FAULT] Schema fault done — written to Kafka AND Databricks.")
 
 # ── Fault 2 ───────────────────────────────────────────────────────
 def inject_data_quality_fault(n_events=30):

@@ -22,7 +22,7 @@ def execute_sql_dml(query: str) -> str:
     Example: DELETE FROM healthcare_db.ehr_stream WHERE spo2 IS NULL
     """
     query = _clean_sql(query)
-    print(f"\n[🛠️ SQL TOOL] Executing DML Query...")
+    print(f"\n[SQL TOOL] Executing DML Query...")
     print(f"> {query}")
 
     try:
@@ -36,5 +36,5 @@ def execute_sql_dml(query: str) -> str:
         return f"SUCCESS: Query executed. {rows} rows affected."
     except Exception as e:
         error_msg = f"FAILED: Database error occurred - {str(e)}"
-        print(f"[❌ ERROR] {error_msg}")
+        print(f"[ERROR] {error_msg}")
         return error_msg
