@@ -1,83 +1,106 @@
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__))
-from patient_generator import generate_patient_event
-from database import get_connection
-
 import json
 import time
 import random
 import argparse
+import threading
 from datetime import datetime
 from confluent_kafka import Producer
 import requests
-import threading
+
+sys.path.insert(0, os.path.dirname(__file__))
+from patient_generator import generate_patient_event
+from database import get_connection
 
 KAFKA_BOOTSTRAP = "localhost:9092"
-
 producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP})
 
 def delivery_report(err, msg):
-    if err:
-        print(f"[ERROR] Delivery failed: {err}")
+    if err: print(f"[ERROR] Delivery failed: {err}")
 
 def _send(topic, event):
-    producer.produce(
-        topic,
-        key=event.get("patient_id", "unknown"),
-        value=json.dumps(event),
-        callback=delivery_report
-    )
+    producer.produce(topic, key=event.get("patient_id", "unknown"), value=json.dumps(event), callback=delivery_report)
     producer.poll(0)
+
+def write_fault_to_db(con, event):
+    """Dynamic DB writer explicitly built to force broken rows into Databricks."""
+    try:
+        cursor = con.cursor()
+        
+        # THE MAGIC FIX: Tell the fault injector to wait in line!
+        try:
+            cursor.execute("PRAGMA busy_timeout = 10000") 
+        except:
+            pass
+
+        try:
+            cursor.execute("SHOW COLUMNS IN healthcare_db.ehr_stream")
+            valid_cols = [row[0] for row in cursor.fetchall()]
+        except:
+            cursor.execute("PRAGMA table_info('healthcare_db.ehr_stream')")
+            valid_cols = [row[1] for row in cursor.fetchall()]
+            if not valid_cols:
+                cursor.execute("PRAGMA table_info('ehr_stream')")
+                valid_cols = [row[1] for row in cursor.fetchall()]
+        
+        if not valid_cols:
+            valid_cols = list(event.keys())
+
+        safe_event = {k: v for k, v in event.items() if k in valid_cols}
+        
+        # CRITICAL: Force spo2 to be NULL so it shows up broken on your dashboard!
+        if "spo2" in valid_cols and "spo2" not in safe_event:
+            safe_event["spo2"] = None
+
+        columns = ", ".join(safe_event.keys())
+        placeholders = ", ".join(["?"] * len(safe_event))
+        values = tuple(safe_event.values())
+        
+        try:
+            cursor.execute(f"INSERT INTO healthcare_db.ehr_stream ({columns}) VALUES ({placeholders})", values)
+        except:
+            cursor.execute(f"INSERT INTO ehr_stream ({columns}) VALUES ({placeholders})", values)
+        con.commit()
+        cursor.close()
+    except Exception as e:
+        print(f"❌ [DB] {e}")
+
 
 # ── Fault 1 ───────────────────────────────────────────────────────
 def inject_schema_fault(n_events=20):
     print(f"[FAULT] SCHEMA — sending {n_events} fault events...")
+    con = get_connection() # Open ONE connection to speed up the loop!
+    
     for _ in range(n_events):
         event = generate_patient_event()
-        event.pop("spo2")
+        event.pop("spo2", None)
         event["diagnosis_code"] = "ICD-" + str(random.randint(1000, 9999))
 
-        # Write to Kafka as before
         _send("ehr-stream", event)
-
-        # Also write directly to Databricks so the fault is real
-        try:
-            con    = get_connection()
-            cursor = con.cursor()
-            cursor.execute("""
-                INSERT INTO healthcare_db.ehr_stream
-                (event_id, patient_id, ward, heart_rate, bp_systolic,
-                 bp_diastolic, temperature_c, respiratory_rate,
-                 timestamp, inserted_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, [
-                event["event_id"], event["patient_id"], event["ward"],
-                event["heart_rate"], event["bp_systolic"],
-                event["bp_diastolic"], event["temperature_c"],
-                event.get("respiratory_rate", 15.0),
-                event["timestamp"], datetime.utcnow().isoformat()
-            ])
-            con.commit()
-            cursor.close()
-            con.close()
-        except Exception as e:
-            print(f"[DB] {e}")
-
+        write_fault_to_db(con, event)
         time.sleep(0.3)
+        
+    con.close()
     producer.flush()
     print("[FAULT] Schema fault done — written to Kafka AND Databricks.")
 
 # ── Fault 2 ───────────────────────────────────────────────────────
-def inject_data_quality_fault(n_events=30):
+def inject_data_quality_fault(n_events=20):
     print(f"[FAULT] DATA QUALITY — sending {n_events} physiologically impossible events...")
+    con = get_connection() # Open the DB connection
+    
     for _ in range(n_events):
         event = generate_patient_event()
         event["heart_rate"]  = round(random.uniform(220, 300), 1)
         event["spo2"]        = round(random.uniform(30, 60), 1)
         event["bp_systolic"] = round(random.uniform(200, 280), 1)
+        
         _send("ehr-stream", event)
+        write_fault_to_db(con, event) # Force it into Databricks!
         time.sleep(0.2)
+        
+    con.close()
     producer.flush()
     print("[FAULT] Data quality fault done.")
 

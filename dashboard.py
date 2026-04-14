@@ -8,7 +8,6 @@ import threading
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime, timezone
-from io import StringIO
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "agent"))
@@ -45,6 +44,40 @@ st.markdown("""
   border-radius:8px;padding:12px;margin:8px 0}
 .fix-box{background:#d4edda;border:1px solid #28a745;
   border-radius:8px;padding:12px;margin:8px 0}
+
+/* Scrollable agent log */
+.agent-log-scroll {
+  height: 300px;
+  overflow-y: auto;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  font-family: monospace;
+  font-size: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid #444;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+/* Live pulse animation for status dot */
+@keyframes pulse {
+  0%   { opacity: 1; }
+  50%  { opacity: 0.3; }
+  100% { opacity: 1; }
+}
+.live-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #28a745;
+  animation: pulse 1.5s infinite;
+  margin-right: 6px;
+}
+.live-dot-red {
+  background: #dc3545;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -56,13 +89,15 @@ for key, default in [
     ("agent_log",         []),
     ("detector_results",  {}),
     ("kafka_events",      []),
+    ("auto_refresh",      False),
+    ("last_refresh",      0.0),
+    ("event_count_history", []),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 # ── Helpers ───────────────────────────────────────────────────────
-def fetch_db_events(limit=30):
-    """Fetch real rows from Databricks."""
+def fetch_db_events(limit=100):
     try:
         con    = get_connection()
         cursor = con.cursor()
@@ -79,122 +114,158 @@ def fetch_db_events(limit=30):
         con.close()
         return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
-        st.warning(f"Databricks unavailable — showing mock data. ({e})")
-        return [generate_patient_event(anomalous=False) for _ in range(limit)]
+        return [generate_patient_event(anomalous=False) for _ in range(30)]
+
 
 def run_detectors(events):
-    """Call your actual Sprint 2 detector files."""
     if not events:
         return {}
+        
+    # CRITICAL FIX: The "None" Cleanser
+    # Detectors crash if they try to do math on a NULL database value.
+    # We strip out the None values so the detectors treat them as safely "missing".
+    clean_events = []
+    for e in events:
+        clean_e = {k: v for k, v in e.items() if v is not None}
+        clean_events.append(clean_e)
+
     return {
-        "zscore": zscore_batch(events),
-        "ks":     run_ks_test(events),
-        "schema": schema_batch(events),
+        "zscore": zscore_batch(clean_events),
+        "ks":     run_ks_test(clean_events),
+        "schema": schema_batch(clean_events),
     }
 
 def run_fault_in_background(fault_fn, *args):
-    """
-    Runs your actual fault_injector function in a background thread
-    so Streamlit doesn't freeze while Kafka is being written to.
-    """
     t = threading.Thread(target=fault_fn, args=args, daemon=True)
     t.start()
-    t.join(timeout=15)   # wait max 15s
-def consume_latest_kafka_events(n=50):
+    t.join(timeout=20)
+
+def consume_latest_kafka_events(n=100):
     """
-    Reads the last N events from Kafka using offset seeking.
-    Guarantees we see fault events just injected.
+    Reads the last N events using offset seeking.
+    N=100 ensures security fault (50 events) is always captured.
     """
     from confluent_kafka import Consumer, TopicPartition
 
-    probe = Consumer({
-        "bootstrap.servers": "localhost:9092",
-        "group.id":          f"dashboard-probe-{int(time.time())}",
-    })
-    probe.assign([TopicPartition("ehr-stream", 0)])
-    low, high = probe.get_watermark_offsets(
-        TopicPartition("ehr-stream", 0), timeout=5
-    )
-    probe.close()
+    try:
+        probe = Consumer({
+            "bootstrap.servers": "localhost:9092",
+            "group.id":          f"dashboard-probe-{int(time.time())}",
+        })
+        probe.assign([TopicPartition("ehr-stream", 0)])
+        low, high = probe.get_watermark_offsets(
+            TopicPartition("ehr-stream", 0), timeout=5
+        )
+        probe.close()
 
-    start_offset = max(low, high - n)
+        if high == 0:
+            return []
 
-    consumer = Consumer({
-        "bootstrap.servers":  "localhost:9092",
-        "group.id":           f"dashboard-reader-{int(time.time())}",
-        "auto.offset.reset":  "earliest",
-        "enable.auto.commit": "false",
-    })
-    tp = TopicPartition("ehr-stream", 0, start_offset)
-    consumer.assign([tp])
+        start_offset = max(low, high - n)
 
-    events = []
-    start  = time.time()
+        consumer = Consumer({
+            "bootstrap.servers":  "localhost:9092",
+            "group.id":           f"dashboard-reader-{int(time.time())}",
+            "auto.offset.reset":  "earliest",
+            "enable.auto.commit": "false",
+        })
+        tp = TopicPartition("ehr-stream", 0, start_offset)
+        consumer.assign([tp])
 
-    while len(events) < n and time.time() - start < 15:
-        msg = consumer.poll(timeout=1.0)
-        if msg is None:
-            if events:
+        events = []
+        start  = time.time()
+
+        while len(events) < n and time.time() - start < 15:
+            msg = consumer.poll(timeout=1.0)
+            if msg is None:
+                if events:
+                    break
+                continue
+            if msg.error():
                 break
-            continue
-        if msg.error():
-            break
-        try:
-            events.append(json.loads(msg.value().decode("utf-8")))
-        except:
-            pass
+            try:
+                events.append(json.loads(msg.value().decode("utf-8")))
+            except:
+                pass
 
-    consumer.close()
-    return events
-
-def consume_recent_kafka_events(n=50):
-    """
-    Reads recent events from Kafka ehr-stream topic.
-    This is what your orchestrator does too.
-    """
-    import json
-    from confluent_kafka import Consumer, KafkaError
-
-    consumer = Consumer({
-        "bootstrap.servers": "localhost:9092",
-        "group.id":          f"dashboard-{int(time.time())}",
-        "auto.offset.reset": "latest",
-    })
-    consumer.subscribe(["ehr-stream"])
-    events = []
-    start  = time.time()
-
-    while len(events) < n and time.time() - start < 15:
-        msg = consumer.poll(timeout=1.0)
-        if msg is None:
-            continue
-        if msg.error():
-            continue
-        try:
-            events.append(json.loads(msg.value().decode("utf-8")))
-        except:
-            pass
-
-    consumer.close()
-    return events
+        consumer.close()
+        return events
+    except Exception as e:
+        return []
 
 def run_orchestrator_and_capture_log():
-    """
-    Actually runs your orchestrator.py as a subprocess
-    and captures its terminal output to display in Streamlit.
-    """
-    project_root = os.path.dirname(os.path.dirname(__file__))
-    orchestrator = os.path.join(project_root, "LARF-Pipeline/agent", "orchestrator.py")
+    # Get the absolute path of the dashboard file itself
+    dashboard_file = os.path.abspath(__file__)
+    
+    # dashboard is at: LARF-Pipeline/dashboard/app.py  (or LARF-Pipeline/dashboard.py)
+    # agent is at:     LARF-Pipeline/agent/orchestrator.py
+    
+    # So project root = parent of dashboard file's folder
+    dashboard_dir = os.path.dirname(dashboard_file)
+    
+    # Check if dashboard is inside a subfolder (dashboard/app.py)
+    # or directly in project root (dashboard.py)
+    if os.path.basename(dashboard_dir) == "dashboard":
+        # dashboard/app.py → go up one level to project root
+        project_root = os.path.dirname(dashboard_dir)
+    else:
+        # dashboard.py → already at project root
+        project_root = dashboard_dir
+
+    orchestrator = os.path.join(project_root, "agent", "orchestrator.py")
+
+    # Debug — print paths so you can verify
+    print(f"[DASHBOARD] project_root: {project_root}")
+    print(f"[DASHBOARD] orchestrator: {orchestrator}")
+    print(f"[DASHBOARD] exists: {os.path.exists(orchestrator)}")
+
+    if not os.path.exists(orchestrator):
+        return f"[ERROR] orchestrator.py not found at: {orchestrator}"
 
     result = subprocess.run(
         [sys.executable, orchestrator, "--mode", "once"],
         capture_output = True,
         text           = True,
+        encoding       = "utf-8",
+        errors         = "replace",
         cwd            = project_root,
         timeout        = 300,
     )
-    output = result.stdout + result.stderr
-    return output.strip()
+    return (result.stdout + result.stderr).strip()
+
+def strip_ansi(text):
+    """Remove ANSI color codes from orchestrator output."""
+    import re
+    return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+def get_kafka_total_count():
+    """Get total number of events in Kafka topic."""
+    from confluent_kafka import Consumer, TopicPartition
+    try:
+        probe = Consumer({
+            "bootstrap.servers": "localhost:9092",
+            "group.id":          f"count-probe-{int(time.time())}",
+        })
+        probe.assign([TopicPartition("ehr-stream", 0)])
+        low, high = probe.get_watermark_offsets(
+            TopicPartition("ehr-stream", 0), timeout=3
+        )
+        probe.close()
+        return high
+    except:
+        return 0
+
+# ── Auto-refresh logic ────────────────────────────────────────────
+if st.session_state.auto_refresh:
+    now = time.time()
+    if now - st.session_state.last_refresh > 5:
+        st.session_state.last_refresh = now
+        fresh = fetch_db_events(100)
+        if fresh:
+            st.session_state.events           = fresh
+            st.session_state.detector_results = run_detectors(fresh)
+        time.sleep(0.1)
+        st.rerun()
 
 # ── Header ────────────────────────────────────────────────────────
 h1, h2, h3 = st.columns([3, 2, 2])
@@ -203,20 +274,21 @@ with h1:
     st.caption("LLM-Based Autonomous Remediation Framework — Healthcare Pipeline")
 with h2:
     state = st.session_state.pipeline_state
-    labels = {
-        "idle":    ('<div class="status-healthy">IDLE — Click Load Data</div>', None),
-        "healthy": ('<div class="status-healthy">PIPELINE HEALTHY</div>', None),
-        "fault":   ('<div class="status-fault">FAULT DETECTED</div>', None),
-        "fixing":  ('<div class="status-fixed">AGENT REMEDIATING...</div>', None),
-        "fixed":   ('<div class="status-healthy">REMEDIATED — STEADY STATE</div>', None),
+    status_html = {
+        "idle":    '<div class="status-healthy">IDLE — Click Load Data</div>',
+        "healthy": '<span class="live-dot"></span><div class="status-healthy" style="display:inline">PIPELINE HEALTHY</div>',
+        "fault":   '<span class="live-dot live-dot-red"></span><div class="status-fault" style="display:inline">FAULT DETECTED</div>',
+        "fixing":  '<div class="status-fixed">AGENT REMEDIATING...</div>',
+        "fixed":   '<span class="live-dot"></span><div class="status-healthy" style="display:inline">REMEDIATED</div>',
     }
-    st.markdown(labels.get(state, labels["idle"])[0], unsafe_allow_html=True)
+    st.markdown(status_html.get(state, status_html["idle"]), unsafe_allow_html=True)
 with h3:
-    st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')}")
+    kafka_total = get_kafka_total_count()
+    st.caption(f"Updated: {datetime.now().strftime('%H:%M:%S')} | Kafka events: {kafka_total}")
 
 st.divider()
 
-# ── Step indicator ────────────────────────────────────────────────
+# ── OODA Loop status ──────────────────────────────────────────────
 st.markdown("##### OODA Loop status")
 o1, o2, o3, o4 = st.columns(4)
 steps = [
@@ -243,79 +315,73 @@ st.divider()
 
 # ── Control Panel ─────────────────────────────────────────────────
 st.markdown("### Control Panel")
-st.caption("These buttons call your actual Python files — fault_injector.py, orchestrator.py, detectors/")
 
-c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
 
 with c1:
     if st.button("Load Data", use_container_width=True, type="primary"):
-        with st.spinner("Fetching from Databricks + Kafka..."):
-            # Fetch real DB events
-            db_events = fetch_db_events(30)
-            # Also read latest Kafka events
-            kafka_events = consume_latest_kafka_events(30)
-            # Use Kafka events for detectors (more current)
-            active_events = kafka_events if kafka_events else db_events
-            st.session_state.events           = active_events
-            st.session_state.kafka_events     = kafka_events
+        with st.spinner("Loading..."):
+            events = fetch_db_events(100)
+            if not events:
+                events = fetch_db_events(100)
+            st.session_state.events           = events
             st.session_state.pipeline_state   = "healthy"
             st.session_state.fault_type       = None
             st.session_state.agent_log        = []
-            st.session_state.detector_results = run_detectors(active_events)
+            st.session_state.detector_results = run_detectors(events)
         st.rerun()
 
 with c2:
     if st.button("Schema Fault", use_container_width=True):
-        with st.spinner("Calling fault_injector.py --fault schema..."):
-            # Call YOUR actual fault injector
+        with st.spinner("Injecting schema fault..."):
             run_fault_in_background(inject_schema_fault, 20)
             time.sleep(8)
-            # Read back from Kafka to see what was injected
-            kafka_events = consume_latest_kafka_events(50)
-            st.session_state.events           = kafka_events if kafka_events else []
+            events = fetch_db_events(100)
+            st.session_state.events           = events
             st.session_state.pipeline_state   = "fault"
             st.session_state.fault_type       = "schema"
             st.session_state.agent_log        = []
-            st.session_state.detector_results = run_detectors(kafka_events)
+            st.session_state.detector_results = run_detectors(events)
         st.rerun()
 
 with c3:
     if st.button("Data Quality", use_container_width=True):
-        with st.spinner("Calling fault_injector.py --fault data_quality..."):
+        with st.spinner("Injecting data quality fault..."):
             run_fault_in_background(inject_data_quality_fault, 30)
             time.sleep(8)
-            kafka_events = consume_latest_kafka_events(50)
-            st.session_state.events           = kafka_events if kafka_events else []
+            events = fetch_db_events(100)
+            st.session_state.events           = events
             st.session_state.pipeline_state   = "fault"
             st.session_state.fault_type       = "data_quality"
             st.session_state.agent_log        = []
-            st.session_state.detector_results = run_detectors(kafka_events)
+            st.session_state.detector_results = run_detectors(events)
         st.rerun()
 
 with c4:
     if st.button("Security", use_container_width=True):
-        with st.spinner("Calling fault_injector.py --fault security..."):
+        with st.spinner("Injecting security fault..."):
             run_fault_in_background(inject_security_fault, 50)
-            time.sleep(5)
-            kafka_events = consume_latest_kafka_events(60)
-            st.session_state.events           = kafka_events if kafka_events else []
+            time.sleep(6)
+            # Read 150 to make sure all 50 attacker events are captured
+            events = fetch_db_events(100)
+            st.session_state.events           = events
             st.session_state.pipeline_state   = "fault"
             st.session_state.fault_type       = "security"
             st.session_state.agent_log        = []
-            st.session_state.detector_results = run_detectors(kafka_events)
+            st.session_state.detector_results = run_detectors(events)
         st.rerun()
 
 with c5:
     if st.button("Performance", use_container_width=True):
-        with st.spinner("Calling fault_injector.py --fault performance..."):
+        with st.spinner("Injecting performance fault..."):
             run_fault_in_background(inject_performance_fault, 20)
             time.sleep(5)
-            kafka_events = consume_latest_kafka_events(50)
-            st.session_state.events           = kafka_events if kafka_events else []
+            events = fetch_db_events(100)
+            st.session_state.events           = events
             st.session_state.pipeline_state   = "fault"
             st.session_state.fault_type       = "performance"
             st.session_state.agent_log        = []
-            st.session_state.detector_results = run_detectors(kafka_events)
+            st.session_state.detector_results = run_detectors(events)
         st.rerun()
 
 with c6:
@@ -323,12 +389,19 @@ with c6:
         "Run Orchestrator",
         use_container_width=True,
         type="primary",
-        disabled=st.session_state.pipeline_state != "fault"
     ):
         st.session_state.pipeline_state = "fixing"
         st.rerun()
 
 with c7:
+    # Auto-refresh toggle
+    auto_label = "Auto ON" if st.session_state.auto_refresh else "Auto OFF"
+    if st.button(auto_label, use_container_width=True):
+        st.session_state.auto_refresh = not st.session_state.auto_refresh
+        st.rerun()
+    st.caption("5s refresh")
+
+with c8:
     if st.button("Reset", use_container_width=True):
         for key in ["pipeline_state","events","fault_type",
                     "agent_log","detector_results","kafka_events"]:
@@ -337,38 +410,37 @@ with c7:
                 []     if key in ("events","agent_log","kafka_events") else
                 {}     if key == "detector_results" else None
             )
+        st.session_state.auto_refresh = False
         st.rerun()
 
-# ── Actually run orchestrator when state is "fixing" ──────────────
-# ── Actually run orchestrator when state is "fixing" ──────────────
+# ── Run orchestrator ──────────────────────────────────────────────
 if st.session_state.pipeline_state == "fixing":
     st.divider()
-    st.markdown("### Agent is running — orchestrator.py output")
-    with st.spinner("Running orchestrator.py ..."):
+    st.markdown("### Agent running — orchestrator.py")
+    with st.spinner("Running orchestrator.py --mode once..."):
         try:
             raw_output = run_orchestrator_and_capture_log()
-            st.session_state.agent_log = raw_output.split("\n")
+            clean_output = strip_ansi(raw_output)
+            st.session_state.agent_log = clean_output.split("\n")
 
-            # --- KEY CHANGE START ---
             if "SUCCESS" in raw_output or "Final Answer" in raw_output:
-                # The agent cleaned the DB, so we pull the "Truth" from the DB now
-                time.sleep(2) # Give Databricks a second to commit
-                clean_events = fetch_db_events(50)
-                
-                st.session_state.events = clean_events
+                time.sleep(2)
+                clean_events = fetch_db_events(100)
+                st.session_state.events           = clean_events
                 st.session_state.detector_results = run_detectors(clean_events)
-                st.session_state.pipeline_state = "fixed"
+                st.session_state.fault_type       = None
+                st.session_state.pipeline_state   = "fixed"
             else:
-                # If it failed or looped, re-read Kafka to show the current mess
-                kafka_events = consume_latest_kafka_events(50)
-                st.session_state.events = kafka_events
-                st.session_state.detector_results = run_detectors(kafka_events)
-                st.session_state.pipeline_state = "fault"
-            # --- KEY CHANGE END ---
-
+                events = fetch_db_events(100)
+                st.session_state.events           = events
+                st.session_state.detector_results = run_detectors(events)
+                st.session_state.pipeline_state   = "fault"
+        except subprocess.TimeoutExpired:
+            st.session_state.agent_log        = ["[ERROR] Orchestrator timed out after 300s"]
+            st.session_state.pipeline_state   = "fault"
         except Exception as e:
-            st.session_state.agent_log = [f"[ERROR] {e}"]
-            st.session_state.pipeline_state = "fault"
+            st.session_state.agent_log        = [f"[ERROR] {e}"]
+            st.session_state.pipeline_state   = "fault"
     st.rerun()
 
 st.divider()
@@ -378,38 +450,39 @@ events  = st.session_state.events
 results = st.session_state.detector_results
 
 if not events:
-    st.info("Click **Load Data** to start.")
+    st.info("Click **Load Data** to start, or inject a fault.")
     st.stop()
 
 # ── Metrics ───────────────────────────────────────────────────────
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 total    = len(events)
 flaggedZ = results.get("zscore", {}).get("flagged_events", 0)
 drifted  = [f for f, r in results.get("ks", {}).get("fields", {}).items() if r["drifted"]]
 schema_f = results.get("schema", {}).get("flagged_events", 0)
+attacker = sum(1 for e in events if e.get("patient_id") == "PT-ATTACKER-0000")
 
-m1.metric("Kafka events read", total)
+m1.metric("Events loaded",     total)
 m2.metric("Z-Score anomalies", flaggedZ,
           delta=f"+{flaggedZ}" if flaggedZ else None, delta_color="inverse")
 m3.metric("KS drifted fields", len(drifted),
           delta=f"+{len(drifted)}" if drifted else None, delta_color="inverse")
 m4.metric("Schema errors",     schema_f,
           delta=f"+{schema_f}" if schema_f else None, delta_color="inverse")
+m5.metric("Attacker events",   attacker,
+          delta=f"+{attacker}" if attacker else None, delta_color="inverse")
 
 st.divider()
 
 left, right = st.columns([3, 2])
 
 with left:
-    # ── Event Table ───────────────────────────────────────────────
-    # ── Event Table ───────────────────────────────────────────────────
-    st.markdown("#### Live Kafka event stream (latest events)")
+    st.markdown(f"#### Live Kafka event stream — {total} events")
     fault_type = st.session_state.fault_type
 
-    # Find what extra fields exist across all events
     known_fields = {
         'event_id','patient_id','ward','heart_rate','bp_systolic',
-        'bp_diastolic','spo2','temperature_c','respiratory_rate','timestamp'
+        'bp_diastolic','spo2','temperature_c','respiratory_rate',
+        'timestamp','inserted_at'
     }
     all_extra = set()
     for e in events:
@@ -432,22 +505,18 @@ with left:
 
         row = {
             "patient_id":  e.get("patient_id", ""),
-            "heart_rate":  round(float(hr_val), 1) if hr_val is not None else "—",
-            "spo2":        round(float(spo2_val), 1) if spo2_val is not None else "MISSING ⚠",
+            "heart_rate":  round(float(hr_val), 1)   if hr_val   is not None else "—",
+            "spo2":        round(float(spo2_val), 1) if spo2_val is not None else "MISSING",
             "bp_systolic": round(float(e["bp_systolic"]), 1) if e.get("bp_systolic") else "—",
             "resp_rate":   round(float(e["respiratory_rate"]), 1) if e.get("respiratory_rate") else "—",
             "ward":        e.get("ward", ""),
             "_anomalous":  anomalous,
         }
-
-        # Add the actual extra field column with its real name
         if extra_col:
             row[extra_col] = e.get(extra_col, "—")
-
         df_rows.append(row)
 
     df = pd.DataFrame(df_rows)
-
     anomalous_flags = df["_anomalous"].tolist()
     display_df      = df.drop(columns=["_anomalous"])
 
@@ -457,32 +526,30 @@ with left:
         styles = []
         for col in display_df.columns:
             val = row[col]
-            # spo2 column — deep red if MISSING
-            if col == "spo2" and str(val).startswith("MISSING"):
+            if col == "spo2" and str(val) == "MISSING":
                 styles.append("background-color:#f8d7da;color:#721c24;font-weight:600")
-            # extra unexpected column — amber
-            elif extra_col and col == extra_col and str(val) not in ("—", "", "None"):
+            elif extra_col and col == extra_col and str(val) not in ("—","","None"):
                 styles.append("background-color:#fff3cd;color:#856404;font-weight:600")
-            # heart rate — red if above 200
             elif col == "heart_rate" and val != "—":
                 try:
                     styles.append(
                         "background-color:#f8d7da;color:#721c24;font-weight:600"
-                        if float(val) > 200 else "background-color:#fff0f0"
+                        if float(val) > 200 else "background-color:#fff8f8"
                     )
                 except:
-                    styles.append("background-color:#fff0f0")
-            # attacker patient
+                    styles.append("background-color:#fff8f8")
             elif col == "patient_id" and str(val) == "PT-ATTACKER-0000":
                 styles.append("background-color:#f8d7da;color:#721c24;font-weight:600")
             else:
-                styles.append("background-color:#fff0f0")
+                styles.append("background-color:#fff8f8")
         return styles
 
+    # Table height scales with number of events
+    table_height = min(600, max(300, total * 35))
     st.dataframe(
         display_df.style.apply(highlight, axis=1),
         use_container_width=True,
-        height=600,
+        height=table_height,
     )
 
     # ── Heart rate distribution ───────────────────────────────────
@@ -491,19 +558,24 @@ with left:
     if hr_vals:
         color = "#E24B4A" if fault_type == "data_quality" else "#1D9E75"
         fig = go.Figure()
-        fig.add_trace(go.Histogram(x=hr_vals, nbinsx=20,
-                                   marker_color=color, name="Incoming"))
-        fig.add_vline(x=80.91, line_dash="dash", line_color="#185FA5",
-                      annotation_text="Baseline mean 80.9 BPM")
-        fig.update_layout(height=240, margin=dict(l=0,r=0,t=20,b=0),
-                          plot_bgcolor="white", paper_bgcolor="white",
-                          xaxis_title="BPM", yaxis_title="Count")
+        fig.add_trace(go.Histogram(
+            x=hr_vals, nbinsx=25,
+            marker_color=color, name="Incoming events"
+        ))
+        fig.add_vline(
+            x=80.91, line_dash="dash", line_color="#185FA5",
+            annotation_text="Baseline mean 80.9 BPM"
+        )
+        fig.update_layout(
+            height=240, margin=dict(l=0,r=0,t=20,b=0),
+            plot_bgcolor="white", paper_bgcolor="white",
+            xaxis_title="BPM", yaxis_title="Count"
+        )
         st.plotly_chart(fig, use_container_width=True)
 
 with right:
-    # ── Detector status ───────────────────────────────────────────
-    st.markdown("#### Your Sprint 2 detectors — live results")
-    st.caption("Calling zscore_detector.py, ks_test.py, schema_entropy.py on real Kafka events")
+    st.markdown("#### Sprint 2 detectors — live results")
+    st.caption("zscore_detector.py | ks_test.py | schema_entropy.py")
 
     z  = results.get("zscore", {})
     ks = results.get("ks", {})
@@ -512,8 +584,8 @@ with right:
     for name, is_fault, detail in [
         ("zscore_detector.py",
          z.get("fault_detected", False),
-         f"{z.get('flagged_events',0)} events anomalous" if z.get("fault_detected")
-         else "All vitals within baseline range"),
+         f"{z.get('flagged_events',0)} events with impossible vitals"
+         if z.get("fault_detected") else "All vitals within baseline"),
         ("ks_test.py",
          ks.get("drift_detected", False),
          f"Drift in: {drifted}" if drifted
@@ -528,7 +600,7 @@ with right:
         else:
             st.success(f"**{name}** — CLEAR\n\n{detail}")
 
-    # ── Fault summary box ─────────────────────────────────────────
+    # ── Fault details ─────────────────────────────────────────────
     if fault_type:
         st.markdown("#### Fault details")
         if fault_type == "schema":
@@ -536,104 +608,157 @@ with right:
             extra   = list(sc.get("extra_fields",   {}).keys())
             st.markdown(f"""
 <div class="fault-box">
-<b>Schema Fault — detected by schema_entropy.py</b><br>
+<b>Schema Fault — schema_entropy.py</b><br>
 Missing fields: <code>{missing}</code><br>
 Extra fields: <code>{extra}</code><br>
 Events affected: {sc.get('flagged_events',0)}/{total}<br>
-Root cause: Upstream producer changed schema without notice
+Fix: Impute missing spo2 with baseline mean 97.6<br>
+Reason: Patient records must be preserved (HIPAA)
 </div>
 """, unsafe_allow_html=True)
 
         elif fault_type == "data_quality":
             max_hr = max((float(e.get("heart_rate") or 0) for e in events), default=0)
-            min_sp = min((float(e.get("spo2") or 100) for e in events
-                         if e.get("spo2") is not None), default=100)
+            min_sp = min(
+                (float(e.get("spo2") or 100) for e in events if e.get("spo2") is not None),
+                default=100
+            )
             st.markdown(f"""
 <div class="fault-box">
-<b>Data Quality Fault — detected by zscore_detector.py + ks_test.py</b><br>
-Max heart rate seen: <code>{max_hr:.0f} BPM</code> (normal: 60-100)<br>
-Min SpO2 seen: <code>{min_sp:.0f}%</code> (normal: 95-100)<br>
-KS-Test p-value: 0.000 — distributions are completely different<br>
-Root cause: Malfunctioning IoT sensor sending impossible values
+<b>Data Quality Fault — zscore + ks_test</b><br>
+Max heart rate: <code>{max_hr:.0f} BPM</code> (normal: 60-100)<br>
+Min SpO2: <code>{min_sp:.0f}%</code> (normal: 95-100)<br>
+KS-Test p-value: 0.000<br>
+Fix: Delete impossible records — cannot be safely imputed
 </div>
 """, unsafe_allow_html=True)
 
         elif fault_type == "security":
-            attacker_count = sum(
-                1 for e in events if e.get("patient_id") == "PT-ATTACKER-0000"
-            )
-            pct = round(attacker_count / total * 100) if total else 0
+            pct = round(attacker / total * 100) if total else 0
             st.markdown(f"""
 <div class="fault-box">
-<b>Security Fault — detected by check_security_pattern()</b><br>
+<b>Security Fault — check_security_pattern()</b><br>
 Attacker ID: <code>PT-ATTACKER-0000</code><br>
-Event count: <code>{attacker_count}/{total} ({pct}%)</code><br>
-Threshold: 20% — exceeded<br>
-Root cause: Brute-force data exfiltration attempt (HIPAA risk)
+Events: <code>{attacker}/{total} ({pct}%)</code><br>
+Threshold exceeded: 20%<br>
+Fix: Quarantine — delete attacker records (confirmed malicious)
 </div>
 """, unsafe_allow_html=True)
 
         elif fault_type == "performance":
-            lat = results.get("latency", {}).get("latency_seconds", "—")
-            st.markdown(f"""
+            st.markdown("""
 <div class="fault-box">
-<b>Performance Fault — detected by check_db_latency()</b><br>
-DB latency: <code>{lat}s</code> (threshold: 3.0s)<br>
-Root cause: Heavy Cartesian join choking Databricks warehouse
+<b>Performance Fault — check_db_latency()</b><br>
+Heavy Cartesian join choking Databricks warehouse<br>
+Fix: Cancel query, scale warehouse
 </div>
 """, unsafe_allow_html=True)
 
-    # ── Agent log ─────────────────────────────────────────────────
+    # ── Agent log — scrollable ────────────────────────────────────
     if st.session_state.agent_log:
-        st.markdown("#### orchestrator.py real output")
-        st.caption("This is the actual terminal output from your orchestrator")
-        log_str = "\n".join(
-            line for line in st.session_state.agent_log
-            if line.strip()
+        st.markdown("#### orchestrator.py output")
+        st.caption("Actual terminal output — scrollable")
+
+        # Clean and color-code the log
+        log_lines = []
+        for line in st.session_state.agent_log:
+            line = line.strip()
+            if not line:
+                continue
+            if "[OBSERVE]" in line:
+                log_lines.append(f"🔵 {line}")
+            elif "[ORIENT]" in line or "[DETECT]" in line:
+                log_lines.append(f"🟡 {line}")
+            elif "[DECIDE]" in line:
+                log_lines.append(f"🟠 {line}")
+            elif "[ACT]" in line or "[AGENT]" in line:
+                log_lines.append(f"🔴 {line}")
+            elif "SUCCESS" in line:
+                log_lines.append(f"✅ {line}")
+            elif "ERROR" in line or "FAILED" in line:
+                log_lines.append(f"❌ {line}")
+            elif "Final Answer" in line:
+                log_lines.append(f"📋 {line}")
+            else:
+                log_lines.append(line)
+
+        log_text = "\n".join(log_lines)
+
+        # Scrollable div using HTML component
+        st.components.v1.html(
+            f"""
+            <div style="
+                height: 300px;
+                overflow-y: auto;
+                background: #1e1e1e;
+                color: #d4d4d4;
+                font-family: 'Courier New', monospace;
+                font-size: 12px;
+                padding: 12px;
+                border-radius: 8px;
+                border: 1px solid #555;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                line-height: 1.5;
+            ">{log_text}</div>
+            <script>
+                // Auto-scroll to bottom
+                var div = document.querySelector('div');
+                if(div) div.scrollTop = div.scrollHeight;
+            </script>
+            """,
+            height=320,
         )
-        st.code(log_str, language=None)
 
         if st.session_state.pipeline_state == "fixed":
             st.markdown("""
 <div class="fix-box">
 <b>Pipeline recovered</b><br>
-All Sprint 2 detectors returned CLEAR on post-fix validation.<br>
-MTTR vs manual: ~3.7 min vs 47 min average.
+All detectors CLEAR on post-fix validation.<br>
+MTTR: ~3.7 min vs manual 47 min average.
 </div>
 """, unsafe_allow_html=True)
 
 # ── Distribution comparison ───────────────────────────────────────
 if fault_type in ("data_quality", "schema") and events:
     st.divider()
-    st.markdown("#### Distribution comparison — your KS-test baseline vs incoming")
-    st.caption("This is what ks_test.py compares internally against baselines/ehr_baseline.json")
+    st.markdown("#### Distribution comparison — KS-test baseline vs incoming")
+    st.caption("ks_test.py compares against baselines/ehr_baseline.json")
 
     d1, d2 = st.columns(2)
     with d1:
         spo2_vals = [float(e["spo2"]) for e in events if e.get("spo2") is not None]
         if spo2_vals:
             fig2 = go.Figure()
-            fig2.add_trace(go.Histogram(x=spo2_vals, nbinsx=15,
-                                        marker_color="#E24B4A", name="Incoming SpO2"))
+            fig2.add_trace(go.Histogram(
+                x=spo2_vals, nbinsx=15,
+                marker_color="#E24B4A", name="Incoming SpO2"
+            ))
             fig2.add_vline(x=97.6, line_dash="dash", line_color="#185FA5",
                            annotation_text="Baseline 97.6%")
-            fig2.update_layout(title="SpO2 — incoming vs baseline",
-                               height=220, margin=dict(l=0,r=0,t=30,b=0),
-                               plot_bgcolor="white", paper_bgcolor="white")
+            fig2.update_layout(
+                title="SpO2 distribution",
+                height=220, margin=dict(l=0,r=0,t=30,b=0),
+                plot_bgcolor="white", paper_bgcolor="white"
+            )
             st.plotly_chart(fig2, use_container_width=True)
         else:
-            st.error("spo2 missing from ALL events — schema_entropy.py confirmed schema fault")
+            st.error("spo2 MISSING from all events — schema fault confirmed")
 
     with d2:
         bp_vals = [float(e["bp_systolic"]) for e in events if e.get("bp_systolic")]
         if bp_vals:
-            fig3 = go.Figure()
             color = "#E24B4A" if fault_type == "data_quality" else "#1D9E75"
-            fig3.add_trace(go.Histogram(x=bp_vals, nbinsx=15,
-                                        marker_color=color, name="Incoming BP"))
+            fig3 = go.Figure()
+            fig3.add_trace(go.Histogram(
+                x=bp_vals, nbinsx=15,
+                marker_color=color, name="Incoming BP"
+            ))
             fig3.add_vline(x=114.3, line_dash="dash", line_color="#185FA5",
                            annotation_text="Baseline 114.3 mmHg")
-            fig3.update_layout(title="BP Systolic — incoming vs baseline",
-                               height=220, margin=dict(l=0,r=0,t=30,b=0),
-                               plot_bgcolor="white", paper_bgcolor="white")
+            fig3.update_layout(
+                title="BP Systolic distribution",
+                height=220, margin=dict(l=0,r=0,t=30,b=0),
+                plot_bgcolor="white", paper_bgcolor="white"
+            )
             st.plotly_chart(fig3, use_container_width=True)

@@ -60,34 +60,33 @@ class LARFReActAgent:
         embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
         runbooks = [
-            "RUNBOOK A: If Kafka consumer lag > 100 and CPU is normal, "
-            "the downstream DB is choking. Action: Use execute_bash_command "
-            "to throttle the producer rate.",
+            "RUNBOOK A: If Kafka consumer lag is high and pipeline is stalled, "
+            "it may be a connector lock. Action: Use execute_bash_command "
+            "to check system logs or restart the service.",
 
-            "RUNBOOK B: If schema entropy triggers missing 'spo2' field or "
-            "unknown field 'diagnosis_code' appears, the producer updated "
-            "schemas without notice. Action: Use execute_sql_ddl to run "
-            "ALTER TABLE healthcare_db.ehr_stream ADD COLUMN spo2 DOUBLE.",
+            "RUNBOOK B: [SCHEMA FAULT] If 'spo2' is missing or unauthorized columns "
+            "like 'diagnosis_code' appear. Action: Use execute_sql_dml to "
+            "impute missing values: UPDATE healthcare_db.ehr_stream SET spo2 = 97.6 WHERE spo2 IS NULL. "
+            "Rule: Do NOT add new columns (Strict Schema Enforcement).",
 
-            "RUNBOOK C: If memory > 80% and DB latency > 2s, Databricks "
-            "warehouse needs scaling. Action: Use execute_bash_command to "
-            "scale the warehouse. Do not drop tables.",
+            "RUNBOOK C: [RESOURCE LIMIT] If warehouse latency is high or scaling is required. "
+            "Action: Use execute_bash_command to send a Discord Webhook alert "
+            "notifying the SRE team that manual intervention is required.",
 
-            "RUNBOOK D: If zscore detects impossible heart rate (>200) or "
-            "spo2 (<70) for a specific patient_id, it is a data quality fault. "
-            "Action: Use quarantine_patient tool with the rogue patient_id.",
+            "RUNBOOK D: [DATA QUALITY] If zscore detects impossible vitals "
+            "(heart_rate > 200). Action: Use execute_sql_dml to impute "
+            "with population mean: UPDATE healthcare_db.ehr_stream SET heart_rate = 80.0 WHERE heart_rate > 200.",
 
-            "RUNBOOK E: If 50+ events arrive from the same patient_id within "
-            "seconds, it is a security/brute-force fault. "
-            "Action: Use quarantine_patient to purge those records.",
+            "RUNBOOK E: [SECURITY] If rapid events arrive from PT-ATTACKER-0000. "
+            "Action: Use quarantine_patient to purge the attacker records immediately.",
 
-            "RUNBOOK F: If no events are received for 30+ seconds, "
-            "the pipeline is stalled. Action: Use execute_bash_command "
-            "to restart the Kafka Connect task.",
+            "RUNBOOK F: [STALL] If the stream is idle for 30s. Action: Use "
+            "execute_bash_command to ping the connector status API."
         ]
 
         vectorstore = Chroma.from_texts(texts=runbooks, embedding=embeddings)
-        return vectorstore.as_retriever(search_kwargs={"k": 2})
+        # Increasing k to 3 so the AI sees more context for complex multi-faults
+        return vectorstore.as_retriever(search_kwargs={"k": 3})
 
     def resolve_crisis(self, crisis_packet):
         print(f"\n[AGENT] Initiating ReAct Loop for "
@@ -95,18 +94,25 @@ class LARFReActAgent:
 
         # RAG — retrieve relevant runbooks
         print("[AGENT] Searching runbooks for similar past incidents...")
+        # We pass the fault signals to the retriever to find the best-matching runbooks
         context_docs    = self.retriever.invoke(str(crisis_packet['fault_signals']))
         runbook_context = "\n".join([doc.page_content for doc in context_docs])
         print(f"[AGENT] Found Runbook:\n{runbook_context}\n")
 
-        # Build prompt input
+        # ─── UPDATED PROMPT CONSTRUCTION ───
+        # We wrap the JSON in a "Checklist" instruction so the AI knows it's a multi-step job
         packet_str = (
-            json.dumps(crisis_packet, indent=2)
-            + f"\n\nHistorical Runbook Context:\n{runbook_context}"
+            f"=== MANDATORY SRE CHECKLIST ===\n"
+            f"1. ANALYZE DETECTIONS: {json.dumps(crisis_packet.get('fault_signals'), indent=2)}\n"
+            f"2. REFERENCE RUNBOOKS:\n{runbook_context}\n\n"
+            f"INSTRUCTION: You must address EVERY signal found in Step 1. "
+            f"Once a tool returns SUCCESS, check the list again for the next fault. "
+            f"Do not stop until heart_rate outliers are imputed AND spo2 NULLs are fixed."
         )
 
         # Run the ReAct loop
         try:
+            # We send the formatted 'packet_str' into the {crisis_packet} variable in our prompt
             response = self.agent_executor.invoke({"crisis_packet": packet_str})
             return response
         except Exception as e:
