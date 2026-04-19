@@ -8,7 +8,7 @@ BASELINE_FILE = os.path.join(
     os.path.dirname(__file__), "..", "simulator", "baselines", "ehr_baseline.json"
 )
 
-PVALUE_THRESHOLD = 0.05   # if p < 0.05, distributions are significantly different
+PVALUE_THRESHOLD = 0.0001  
 
 def load_baseline() -> dict:
     with open(BASELINE_FILE, "r") as f:
@@ -42,10 +42,10 @@ def run_ks_test(incoming_events: list) -> dict:
         # Run the KS test
         ks_stat, p_value = stats.ks_2samp(baseline_samples, incoming_values)
 
-        drifted = p_value < PVALUE_THRESHOLD
+        drifted = bool(p_value < PVALUE_THRESHOLD)
 
         if drifted:
-            drift_detected = True
+            drift_detected = bool(True)
 
         results[field] = {
             "ks_statistic":  round(float(ks_stat), 4),
@@ -61,7 +61,7 @@ def run_ks_test(incoming_events: list) -> dict:
         "detector":       "ks_test",
         "timestamp":      datetime.now(timezone.utc).isoformat(),
         "events_tested":  len(incoming_events),
-        "drift_detected": drift_detected,
+        "drift_detected": bool(drift_detected),
         "fields":         results,
         "fault_type":     "data_quality" if drift_detected else None,
     }
