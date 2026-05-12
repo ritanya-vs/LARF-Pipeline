@@ -255,15 +255,6 @@ This project is based on the following research paper:
 > Available on ResearchGate:
 > https://www.researchgate.net/publication/399858133_From_Streaming_to_Self-Healing_LLM-Based_Autonomous_Remediation_in_Kafka_Snowflake_Pipelines_for_Healthcare_Big_Data
 
-### Key results from the paper we reproduced
-
-| Metric | Paper reports | Our implementation |
-|---|---|---|
-| Mean Time to Recovery | 3.7 min avg | 3.7 min avg |
-| Diagnosis accuracy | 94.2% | 94.2% |
-| Remediation success rate | 92.5% | 92.5% |
-| False positive rate | 2.5% | 2.5% |
-| Baseline manual MTTR | 47.2 min | 47.2 min |
 
 ### What we adapted from the paper
 
